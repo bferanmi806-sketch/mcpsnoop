@@ -326,6 +326,148 @@ func TestJSONRPCErrorReplays(t *testing.T) {
 	}
 }
 
+// wireObject decodes one stdout line into its top-level members for
+// fidelity assertions.
+func wireObject(t *testing.T, line string) map[string]json.RawMessage {
+	t.Helper()
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(line), &obj); err != nil {
+		t.Fatalf("stdout is not a JSON object: %q", line)
+	}
+	return obj
+}
+
+// TestRecordedMissingJsonrpcPreserved: a response the server sent without
+// jsonrpc replays without one. The mock reproduces, never repairs.
+func TestRecordedMissingJsonrpcPreserved(t *testing.T) {
+	srv := loadFrames(t, []testFrame{
+		c2s(req("1", "tools/list", `{}`)),
+		s2c(`{"id":1,"result":{"tools":[]}}`),
+	})
+	res := serveInput(t, srv, req("9", "tools/list", `{}`)+"\n", defaultPolicy())
+	if len(res.responses) != 1 {
+		t.Fatalf("responses = %d, want 1, stderr %q", len(res.responses), res.stderr)
+	}
+	obj := wireObject(t, res.raws[0])
+	if _, ok := obj["jsonrpc"]; ok {
+		t.Fatalf("replay must not add a missing jsonrpc: %s", res.raws[0])
+	}
+	if string(obj["id"]) != "9" {
+		t.Fatalf("id = %s, want 9", obj["id"])
+	}
+	if canonical(t, obj["result"]) != `{"tools":[]}` {
+		t.Fatalf("result changed: %s", obj["result"])
+	}
+}
+
+// TestRecordedWrongJsonrpcPreserved: a non-2.0 jsonrpc replays unchanged.
+func TestRecordedWrongJsonrpcPreserved(t *testing.T) {
+	srv := loadFrames(t, []testFrame{
+		c2s(req("1", "tools/list", `{}`)),
+		s2c(`{"jsonrpc":"1.0","id":1,"result":{"tools":[]}}`),
+	})
+	res := serveInput(t, srv, req("9", "tools/list", `{}`)+"\n", defaultPolicy())
+	if len(res.responses) != 1 {
+		t.Fatalf("responses = %d, want 1", len(res.responses))
+	}
+	obj := wireObject(t, res.raws[0])
+	if string(obj["jsonrpc"]) != `"1.0"` {
+		t.Fatalf("jsonrpc = %s, want the recorded \"1.0\"", obj["jsonrpc"])
+	}
+}
+
+// TestRecordedUnknownTopLevelFieldPreserved: extension members ride through.
+func TestRecordedUnknownTopLevelFieldPreserved(t *testing.T) {
+	srv := loadFrames(t, []testFrame{
+		c2s(req("1", "tools/list", `{}`)),
+		s2c(`{"jsonrpc":"2.0","id":1,"result":{"tools":[]},"note":"extra"}`),
+	})
+	res := serveInput(t, srv, req("9", "tools/list", `{}`)+"\n", defaultPolicy())
+	if len(res.responses) != 1 {
+		t.Fatalf("responses = %d, want 1", len(res.responses))
+	}
+	obj := wireObject(t, res.raws[0])
+	if string(obj["note"]) != `"extra"` {
+		t.Fatalf("unknown top-level field lost: %s", res.raws[0])
+	}
+}
+
+// TestRecordedErrorPreservedWhole: the error object replays with data and
+// unknown members intact, under the incoming id.
+func TestRecordedErrorPreservedWhole(t *testing.T) {
+	srv := loadFrames(t, []testFrame{
+		c2s(req("1", "tools/call", `{"name":"nope"}`)),
+		s2c(`{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"boom","data":{"field":"q"},"mystery":"kept"}}`),
+	})
+	res := serveInput(t, srv, req("8", "tools/call", `{"name":"nope"}`)+"\n", defaultPolicy())
+	if len(res.responses) != 1 {
+		t.Fatalf("responses = %d, want 1", len(res.responses))
+	}
+	obj := wireObject(t, res.raws[0])
+	if string(obj["id"]) != "8" {
+		t.Fatalf("id = %s, want 8", obj["id"])
+	}
+	var errObj map[string]json.RawMessage
+	if err := json.Unmarshal(obj["error"], &errObj); err != nil {
+		t.Fatalf("error is not an object: %s", obj["error"])
+	}
+	if string(errObj["code"]) != "-32000" || string(errObj["message"]) != `"boom"` {
+		t.Fatalf("code/message changed: %s", obj["error"])
+	}
+	if canonical(t, errObj["data"]) != `{"field":"q"}` {
+		t.Fatalf("data changed: %s", errObj["data"])
+	}
+	if string(errObj["mystery"]) != `"kept"` {
+		t.Fatalf("unknown error member lost: %s", obj["error"])
+	}
+}
+
+// TestRecordedBothResultAndErrorPreserved: a response carrying both is not
+// collapsed to one half.
+func TestRecordedBothResultAndErrorPreserved(t *testing.T) {
+	srv := loadFrames(t, []testFrame{
+		c2s(req("1", "tools/call", `{"name":"odd"}`)),
+		s2c(`{"jsonrpc":"2.0","id":1,"result":{"a":1},"error":{"code":-1,"message":"both"}}`),
+	})
+	res := serveInput(t, srv, req("8", "tools/call", `{"name":"odd"}`)+"\n", defaultPolicy())
+	if len(res.responses) != 1 {
+		t.Fatalf("responses = %d, want 1", len(res.responses))
+	}
+	obj := wireObject(t, res.raws[0])
+	if canonical(t, obj["result"]) != `{"a":1}` {
+		t.Fatalf("result changed: %s", res.raws[0])
+	}
+	if canonical(t, obj["error"]) != `{"code":-1,"message":"both"}` {
+		t.Fatalf("error changed: %s", res.raws[0])
+	}
+}
+
+// TestFIFOOutOfOrderResponsesDocumented: two identical requests whose
+// responses arrive out of order replay in response-arrival order. The queue
+// behind one match key follows the order the answers were recorded on the
+// wire, not the order the requests were sent; neither the issue nor a
+// maintainer has defined "recorded order" the other way, so this test pins
+// the current rule rather than changing it.
+func TestFIFOOutOfOrderResponsesDocumented(t *testing.T) {
+	srv := loadFrames(t, []testFrame{
+		c2s(req("1", "tools/call", `{"name":"counter"}`)),
+		c2s(req("2", "tools/call", `{"name":"counter"}`)),
+		s2c(`{"jsonrpc":"2.0","id":2,"result":{"n":2}}`),
+		s2c(`{"jsonrpc":"2.0","id":1,"result":{"n":1}}`),
+	})
+	res := serveInput(t, srv,
+		req("10", "tools/call", `{"name":"counter"}`)+"\n"+
+			req("11", "tools/call", `{"name":"counter"}`)+"\n",
+		defaultPolicy())
+	if len(res.responses) != 2 {
+		t.Fatalf("responses = %d, want 2", len(res.responses))
+	}
+	if string(res.responses[0].Result) != `{"n":2}` || string(res.responses[1].Result) != `{"n":1}` {
+		t.Fatalf("expected response-arrival order n=2,n=1, got %s %s",
+			res.responses[0].Result, res.responses[1].Result)
+	}
+}
+
 func TestMRTRChainReplays(t *testing.T) {
 	srv := loadFrames(t, []testFrame{
 		metaFrame(),

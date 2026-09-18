@@ -75,11 +75,13 @@ type Policy struct {
 }
 
 // exchange is one recorded wire exchange: a request the capture answered and
-// the answer it got. MRTR hops are separate exchanges sharing one logical
-// operation; the store already decided the linkage and this only replays it.
+// the complete recorded response object. The bytes are the wire truth, not a
+// reconstruction: a mock reproduces what the server actually did, including
+// malformed or extension-bearing frames, so only the id is ever swapped.
+// MRTR hops are separate exchanges sharing one logical call; the store
+// already decided the linkage and this only replays it.
 type exchange struct {
-	result json.RawMessage
-	err    *proxy.RPCError
+	response json.RawMessage
 }
 
 // group is the FIFO queue of recorded exchanges behind one match key.
@@ -237,9 +239,11 @@ func build(st *store.Store, sessionID string, redacted bool) *Server {
 				continue
 			}
 			delete(requests, key) // one wire request is answered once
+			// Parsing only establishes that this is a correlated response;
+			// the bytes stored for serving are the recorded object itself.
 			msg, ok := proxy.ParseRPC(ev.Raw)
 			if !ok || (len(msg.Result) == 0 && msg.Error == nil) {
-				continue // malformed answer, not an exchange to replay
+				continue // no answer payload, not an exchange to replay
 			}
 			match := matchKey(req.method, req.params)
 			g := srv.groups[match]
@@ -247,7 +251,7 @@ func build(st *store.Store, sessionID string, redacted bool) *Server {
 				g = &group{}
 				srv.groups[match] = g
 			}
-			g.exchanges = append(g.exchanges, exchange{result: msg.Result, err: msg.Error})
+			g.exchanges = append(g.exchanges, exchange{response: append(json.RawMessage(nil), ev.Raw...)})
 			srv.exchanges++
 		}
 	}
@@ -417,24 +421,33 @@ func serveUnmatched(out io.Writer, errW io.Writer, msg proxy.RPCMessage, policy 
 }
 
 // writeResponse replays one recorded exchange under the incoming request id.
-// The recorded id is never echoed. Results and JSON-RPC errors replay exactly
-// in meaning; a request the capture never answered has no exchange and never
-// reaches here.
+// Only the top-level id is replaced; the recorded object is otherwise
+// preserved byte-for-byte in meaning. A missing or wrong jsonrpc stays as the
+// server sent it, extra top-level fields survive, a response carrying both
+// result and error is not collapsed, and error members are never pruned. A
+// request the capture never answered has no exchange and never reaches here.
 func writeResponse(out io.Writer, incomingID json.RawMessage, ex exchange) error {
-	frame := map[string]any{"jsonrpc": "2.0", "id": incomingID}
-	if ex.err != nil {
-		frame["error"] = ex.err
-	} else {
-		result := ex.result
-		if len(bytes.TrimSpace(result)) == 0 {
-			result = json.RawMessage("null")
-		}
-		frame["result"] = result
+	var frame map[string]json.RawMessage
+	if err := json.Unmarshal(ex.response, &frame); err != nil {
+		return err
 	}
-	return writeFrame(out, frame)
+	if frame == nil {
+		frame = make(map[string]json.RawMessage)
+	}
+	frame["id"] = append(json.RawMessage(nil), bytes.TrimSpace(incomingID)...)
+	return writeRawFrame(out, frame)
 }
 
 func writeFrame(out io.Writer, frame map[string]any) error {
+	b, err := jsonwire.Marshal(frame)
+	if err != nil {
+		return err
+	}
+	_, err = out.Write(append(b, '\n'))
+	return err
+}
+
+func writeRawFrame(out io.Writer, frame map[string]json.RawMessage) error {
 	b, err := jsonwire.Marshal(frame)
 	if err != nil {
 		return err
