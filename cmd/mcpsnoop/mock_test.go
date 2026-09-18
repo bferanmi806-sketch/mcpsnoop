@@ -117,24 +117,40 @@ func TestMockServesFileCapture(t *testing.T) {
 	}
 }
 
-func TestMockReadsCaptureFromStdin(t *testing.T) {
-	var buf bytes.Buffer
-	for _, e := range mockCapture() {
-		b, err := json.Marshal(e)
-		if err != nil {
-			t.Fatal(err)
-		}
-		buf.Write(b)
-		buf.WriteByte('\n')
-	}
-	// The piped capture is consumed as the cassette; the mock then sees
-	// end-of-input and exits cleanly with no protocol output.
-	code, stdout, _ := executeMock(t, []string{"-"}, buf.String())
-	if code != 0 {
-		t.Fatalf("exit = %d, want 0", code)
+func TestMockStdinCaptureRejected(t *testing.T) {
+	// One stdin cannot carry both the cassette and the MCP session: the mock
+	// serves requests on stdin, so a piped capture would consume the very
+	// stream the server role needs. Rejected loudly rather than silently
+	// serving nothing.
+	code, stdout, stderr := executeMock(t, []string{"-"}, "{}\n")
+	if code != 2 {
+		t.Fatalf("exit = %d, want 2", code)
 	}
 	if stdout != "" {
 		t.Fatalf("stdout = %q, want empty", stdout)
+	}
+	if !strings.Contains(stderr, "stdin") {
+		t.Fatalf("stderr = %q, want the stdin conflict explained", stderr)
+	}
+}
+
+func TestMockRejectsHTTPCapture(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "http.jsonl")
+	envs := []proxy.Envelope{
+		mockEnvelope("s-http", 1, proxy.ClientToServer, `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`, false),
+		mockEnvelope("s-http", 2, proxy.ServerToClient, `{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}`, false),
+	}
+	for i := range envs {
+		envs[i].Transport = proxy.TransportHTTP
+	}
+	writeMockLog(t, path, envs...)
+	code, _, stderr := executeMock(t, []string{path},
+		`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`+"\n")
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "stdio") {
+		t.Fatalf("stderr = %q, want the stdio-only refusal", stderr)
 	}
 }
 

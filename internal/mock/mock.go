@@ -12,11 +12,12 @@
 //
 // Matching is strict by decision of issue #208's conservative direction:
 // method plus structurally normalized params, with only the volatile _meta keys
-// stripped. An unmatched request gets a JSON-RPC error naming the method, never
-// a silent unrelated answer. Nothing is synthesised: a server/discover the
-// capture never recorded is answered with an error (the spec's own stdio
-// fallback then lets a legacy client fall back to initialize), and a request
-// the capture never answered has no exchange to serve.
+// stripped (plus top-level clientInfo on initialize alone). An unmatched
+// request gets a JSON-RPC error naming the method, never a silent unrelated
+// answer. Nothing is synthesised: a server/discover the capture never recorded
+// is answered with an error (the spec's own stdio fallback then lets a legacy
+// client fall back to initialize), and a request the capture never answered
+// has no exchange to serve. Only stdio captures serve; HTTP is refused.
 //
 // Stdout is protocol-only. Diagnostics go to stderr.
 package mock
@@ -25,6 +26,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -112,31 +114,64 @@ func (s *Server) Exchanges() int { return s.exchanges }
 // first session, the same rule exporter.Load applies to a multi-session log.
 // A capture with no meta frame still loads: the recorded command is what
 // replay needs and mock needs nothing from it.
+//
+// Loading is strict: unlike the live proxy.Decode path, a truncated final
+// envelope is a corrupt cassette and fails here rather than reading as a
+// clean end. Only stdio captures serve: a session explicitly captured on
+// another transport (HTTP) is refused, while a legacy log whose frames name
+// no transport is accepted.
 func Load(r io.Reader, source string) (*Server, error) {
 	st := store.New()
 	var firstSession string
 	redacted := false
-	if err := proxy.Decode(r, func(env proxy.Envelope) {
+	// Decoded with a plain decoder rather than proxy.Decode on purpose: Decode
+	// treats a torn tail as a clean end, which is right for a live stream and
+	// wrong for a cassette, where the missing bytes are the finding.
+	dec := json.NewDecoder(r)
+	for {
+		var env proxy.Envelope
+		if err := dec.Decode(&env); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return nil, fmt.Errorf("%s: invalid JSONL envelope: %w", source, err)
+		}
 		if firstSession == "" {
 			firstSession = env.SessionID
 		}
-		if env.Redacted {
-			redacted = true
-		}
-		for _, h := range env.MCPParamHeaders {
-			if h.Redacted {
+		// Scoped to the served session only, so a redacted second session in a
+		// concatenated file never makes a clean first session unservable.
+		if env.SessionID == firstSession {
+			if env.Redacted {
 				redacted = true
-				break
+			}
+			for _, h := range env.MCPParamHeaders {
+				if h.Redacted {
+					redacted = true
+					break
+				}
 			}
 		}
 		st.Ingest(env)
-	}); err != nil {
-		return nil, fmt.Errorf("%s: invalid JSONL envelope: %w", source, err)
 	}
 	if firstSession == "" {
 		return nil, fmt.Errorf("%s: no envelopes found", source)
 	}
+	if transport := sessionTransport(st, firstSession); transport != "" && transport != proxy.TransportStdio {
+		return nil, fmt.Errorf("%s: session %q was captured on %q transport, mock serves stdio captures only", source, firstSession, transport)
+	}
 	return build(st, firstSession, redacted), nil
+}
+
+// sessionTransport is the channel the session was captured on, empty for a
+// legacy log whose frames named none.
+func sessionTransport(st *store.Store, sessionID string) string {
+	for _, h := range st.Sessions() {
+		if h.ID == sessionID {
+			return h.Transport
+		}
+	}
+	return ""
 }
 
 // LoadFile is Load over a capture file.
@@ -149,54 +184,68 @@ func LoadFile(path string) (*Server, error) {
 	return Load(f, path)
 }
 
-// pendingReq is a request frame still waiting for its wire response.
-type pendingReq struct {
+// wireRequest is a recorded client request frame the mock may have to answer.
+type wireRequest struct {
 	method string
 	params json.RawMessage
 }
 
-// build pairs each request frame with its wire response in timeline order.
-// Pairing is by JSON-RPC id alone, which is the wire correlation, not the MRTR
-// linkage: that decision already happened in the store (a linked retry shares
-// its call and carries MRTRRoot, an ambiguous one does not) and is preserved
-// here by keeping every hop a distinct exchange instead of collapsing Calls().
+// wireKey identifies one physical request frame: its JSON-RPC id plus the
+// store call it opened. The call half is what keeps this from becoming a
+// second correlation engine.
+type wireKey struct {
+	id      string
+	callSeq uint64
+}
+
+// build indexes the recorded wire exchanges off the store's own correlation.
+// Only the server role is served: client-to-server requests and the
+// server-to-client responses the store matched to them. A response is paired
+// with the request its event's call names, which is how an id reused in flight
+// resolves: the store marks the earlier request Superseded and the later one
+// owns the eventual response, so the earlier one can never consume it. MRTR
+// hops stay separate physical exchanges sharing one logical call, and an
+// ambiguous retry the store refused to link stays its own exchange, because
+// the linkage is only ever read here, never decided.
 func build(st *store.Store, sessionID string, redacted bool) *Server {
 	srv := &Server{sessionID: sessionID, groups: make(map[string]*group), redacted: redacted}
-	pending := make(map[string][]pendingReq)
+	requests := make(map[wireKey]wireRequest)
 	for _, ev := range st.Timeline(sessionID) {
 		switch ev.Kind {
 		case store.EventRequest:
-			if ev.ID == "" || isNullID(ev.ID) || len(ev.Raw) == 0 {
+			if ev.Dir != proxy.ClientToServer {
+				continue
+			}
+			if ev.ID == "" || isNullID(ev.ID) || len(ev.Raw) == 0 || ev.Call == nil {
 				continue
 			}
 			msg, ok := proxy.ParseRPC(ev.Raw)
 			if !ok || msg.Method == "" {
 				continue
 			}
-			pending[ev.ID] = append(pending[ev.ID], pendingReq{method: msg.Method, params: msg.Params})
+			requests[wireKey{ev.ID, ev.Call.RequestSeq}] = wireRequest{method: msg.Method, params: msg.Params}
 		case store.EventResponse:
-			if ev.ID == "" || len(ev.Raw) == 0 {
+			if ev.Dir != proxy.ServerToClient {
 				continue
 			}
-			queue := pending[ev.ID]
-			if len(queue) == 0 {
-				continue // a response with no recorded request, nothing to serve
+			if ev.ID == "" || len(ev.Raw) == 0 || ev.Call == nil {
+				continue // no recorded request behind it, nothing to serve
 			}
-			req := queue[0]
-			if len(queue) == 1 {
-				delete(pending, ev.ID)
-			} else {
-				pending[ev.ID] = queue[1:]
+			key := wireKey{ev.ID, ev.Call.RequestSeq}
+			req, ok := requests[key]
+			if !ok {
+				continue
 			}
+			delete(requests, key) // one wire request is answered once
 			msg, ok := proxy.ParseRPC(ev.Raw)
 			if !ok || (len(msg.Result) == 0 && msg.Error == nil) {
 				continue // malformed answer, not an exchange to replay
 			}
-			key := matchKey(req.method, req.params)
-			g := srv.groups[key]
+			match := matchKey(req.method, req.params)
+			g := srv.groups[match]
 			if g == nil {
 				g = &group{}
-				srv.groups[key] = g
+				srv.groups[match] = g
 			}
 			g.exchanges = append(g.exchanges, exchange{result: msg.Result, err: msg.Error})
 			srv.exchanges++
@@ -215,25 +264,33 @@ func matchKey(method string, params json.RawMessage) string {
 
 // normalizeParams canonicalizes params so key order and insignificant
 // whitespace never affect matching, while only the volatile identity keys are
-// dropped. Anything unparseable falls back to its raw bytes, which can only
-// miss, never falsely match.
+// dropped. Omitted params, explicit null and {} stay three different keys: an
+// object left empty by volatile stripping is still an explicit empty object,
+// not absent params. Numbers decode exactly (UseNumber), so distinct integers
+// can never collapse to one key the way float64 would merge them. Anything
+// unparseable, or with trailing garbage, falls back to its raw bytes, which
+// can only miss, never falsely match.
 func normalizeParams(method string, params json.RawMessage) string {
 	trimmed := bytes.TrimSpace(params)
-	if len(trimmed) == 0 || string(trimmed) == "null" {
-		return ""
+	if len(trimmed) == 0 {
+		return "absent"
 	}
+	if string(trimmed) == "null" {
+		return "null"
+	}
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	dec.UseNumber()
 	var v any
-	if err := json.Unmarshal(trimmed, &v); err != nil {
+	if err := dec.Decode(&v); err != nil {
+		return "raw:" + string(trimmed)
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
 		return "raw:" + string(trimmed)
 	}
 	stripVolatileMeta(v)
 	if method == "initialize" {
 		stripLegacyClientIdentity(v)
-	}
-	// An empty object after stripping means the params carried nothing but
-	// volatile _meta, which is the same logical call as no params at all.
-	if m, ok := v.(map[string]any); ok && len(m) == 0 {
-		return ""
 	}
 	b, err := jsonwire.Marshal(v)
 	if err != nil {
@@ -242,19 +299,18 @@ func normalizeParams(method string, params json.RawMessage) string {
 	return string(b)
 }
 
-// stripLegacyClientIdentity drops the legacy handshake's client identity from
+// stripLegacyClientIdentity drops the legacy handshake's clientInfo from
 // initialize params. Before the stateless revision there was no _meta to ride
-// on, so clientInfo and capabilities travelled top-level; they name the client
-// the same way the volatile _meta keys do, and a different client replaying
-// the handshake is the ordinary case. The proposed protocolVersion stays: it
-// is the semantic half of the handshake.
+// on, so the client name travelled top-level, and a different client replaying
+// the handshake is the ordinary case. Capabilities stay strict: they are a
+// semantic declaration the server may legitimately answer differently, as does
+// the proposed protocolVersion.
 func stripLegacyClientIdentity(v any) {
 	m, ok := v.(map[string]any)
 	if !ok {
 		return
 	}
 	delete(m, "clientInfo")
-	delete(m, "capabilities")
 }
 
 // stripVolatileMeta removes the volatile _meta entries in place. Only the

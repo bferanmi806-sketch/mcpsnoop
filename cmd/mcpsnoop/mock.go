@@ -12,7 +12,7 @@ import (
 func newMockCmd() *cobra.Command {
 	var allowRedacted bool
 	cmd := &cobra.Command{
-		Use:   "mock <session-id|log.jsonl|->",
+		Use:   "mock <session-id|log.jsonl>",
 		Short: "Serve a captured session back as a stdio MCP server",
 		Long: `Serve a captured session back as a stdio MCP server.
 
@@ -30,12 +30,13 @@ continuation replay as the recorded hops, task calls replay as recorded
 exchanges, and a server/discover the capture never recorded is answered with
 an error rather than a synthesised result.
 
-Use - to read the capture from stdin. The mock serves on stdin as well, so a
-piped capture is consumed as the cassette and the mock then sees
-end-of-input.
+Stdio captures only: a session explicitly captured on another transport
+(HTTP) is refused, since ConnID and transport semantics are out of scope for
+this issue. A legacy log whose frames name no transport is accepted.
 
-Stdio only: an HTTP capture's JSON-RPC exchanges serve the same way, but the
-mock never listens on HTTP.`,
+There is no - stdin form. The mock serves MCP requests on stdin, so a capture
+piped on stdin would consume the very stream the server role needs; passing -
+is rejected rather than silently serving nothing.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runMock(cmd, args[0], allowRedacted)
@@ -47,21 +48,16 @@ mock never listens on HTTP.`,
 }
 
 func runMock(cmd *cobra.Command, arg string, allowRedacted bool) error {
-	var (
-		srv *mock.Server
-		err error
-	)
 	if arg == "-" {
-		srv, err = mock.Load(cmd.InOrStdin(), "stdin")
-	} else {
-		var path string
-		path, err = exporter.ResolveSessionPath(arg)
-		if err != nil {
-			fmt.Fprintln(cmd.ErrOrStderr(), "mcpsnoop mock:", err)
-			return exitCode(1)
-		}
-		srv, err = mock.LoadFile(path)
+		fmt.Fprintln(cmd.ErrOrStderr(), "mcpsnoop mock: reading the capture from stdin cannot also serve MCP requests on stdin; pass a session id or log.jsonl path instead")
+		return exitCode(2)
 	}
+	path, err := exporter.ResolveSessionPath(arg)
+	if err != nil {
+		fmt.Fprintln(cmd.ErrOrStderr(), "mcpsnoop mock:", err)
+		return exitCode(1)
+	}
+	srv, err := mock.LoadFile(path)
 	if err != nil {
 		fmt.Fprintln(cmd.ErrOrStderr(), "mcpsnoop mock:", err)
 		return exitCode(1)

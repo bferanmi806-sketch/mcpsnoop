@@ -37,21 +37,38 @@ func s2c(rpc string) testFrame { return testFrame{dir: proxy.ServerToClient, rpc
 // on any load error.
 func loadFrames(t *testing.T, frames []testFrame) *Server {
 	t.Helper()
-	var buf bytes.Buffer
+	return loadEnvelopes(t, frameEnvelopes(t, "test-session", proxy.TransportStdio, frames))
+}
+
+// frameEnvelopes numbers frames into envelopes for one session and transport.
+// A transport of "" marks nothing, which is what a legacy log looks like.
+func frameEnvelopes(t *testing.T, session, transport string, frames []testFrame) []proxy.Envelope {
+	t.Helper()
+	out := make([]proxy.Envelope, 0, len(frames))
 	for i, f := range frames {
 		env := proxy.Envelope{
-			SessionID:   "test-session",
+			SessionID:   session,
 			ServerLabel: "test",
 			Seq:         uint64(i + 1),
 			TS:          time.Now(),
 			Direction:   f.dir,
-			Transport:   proxy.TransportStdio,
+			Transport:   transport,
 			Redacted:    f.redacted,
 		}
 		if f.rpc != "" {
 			env.Raw = json.RawMessage(f.rpc)
 		}
-		b, err := json.Marshal(env)
+		out = append(out, env)
+	}
+	return out
+}
+
+// loadEnvelopes serves prebuilt envelopes as a JSONL capture.
+func loadEnvelopes(t *testing.T, envs []proxy.Envelope) *Server {
+	t.Helper()
+	var buf bytes.Buffer
+	for _, e := range envs {
+		b, err := json.Marshal(e)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -487,6 +504,209 @@ func TestLegacyCaptureDiscoverRule(t *testing.T) {
 	init := res.responses[1]
 	if init.Error != nil || !strings.Contains(string(init.Result), "corpus") {
 		t.Fatalf("initialize must replay after the discover miss: %+v %s", init.Error, init.Result)
+	}
+}
+
+// TestInitializeCapabilitiesStrict: only clientInfo is identity on the legacy
+// handshake. Different capabilities are a semantic difference and must not
+// match, even with the client name changed too.
+func TestInitializeCapabilitiesStrict(t *testing.T) {
+	srv := loadFrames(t, []testFrame{
+		c2s(req("1", "initialize", `{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"c"}}`)),
+		s2c(`{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"corpus"}}}`),
+	})
+	res := serveInput(t, srv,
+		req("2", "initialize", `{"protocolVersion":"2025-06-18","capabilities":{"sampling":{}},"clientInfo":{"name":"other"}}`)+"\n",
+		defaultPolicy())
+	if len(res.responses) != 1 || res.responses[0].Error == nil {
+		t.Fatalf("different capabilities must not match, got %+v", res.responses)
+	}
+	if !strings.Contains(res.responses[0].Error.Message, "initialize") {
+		t.Fatalf("error must name the method: %+v", res.responses[0].Error)
+	}
+}
+
+// TestSupersededIDReuse: the second request reuses id 1 while the first is
+// still in flight, so the store marks the first Superseded and the later
+// request owns the eventual response. The mock must index that response to
+// the tools/list the store considers current, never to the orphaned call.
+func TestSupersededIDReuse(t *testing.T) {
+	srv := loadFrames(t, []testFrame{
+		c2s(req("1", "tools/call", `{"name":"echo","arguments":{"text":"hi"}}`)),
+		c2s(req("1", "tools/list", `{}`)),
+		s2c(`{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}`),
+	})
+	if srv.Exchanges() != 1 {
+		t.Fatalf("exchanges = %d, want 1 (the superseded request owns nothing)", srv.Exchanges())
+	}
+	res := serveInput(t, srv,
+		req("10", "tools/list", `{}`)+"\n"+
+			req("11", "tools/call", `{"name":"echo","arguments":{"text":"hi"}}`)+"\n",
+		defaultPolicy())
+	if len(res.responses) != 2 {
+		t.Fatalf("responses = %d, want 2", len(res.responses))
+	}
+	if res.responses[0].Error != nil {
+		t.Fatalf("the current request must replay: %+v", res.responses[0].Error)
+	}
+	if second := res.responses[1]; second.Error == nil {
+		t.Fatalf("the superseded request must not consume the response, got %s", second.Result)
+	} else if !strings.Contains(second.Error.Message, "tools/call") {
+		t.Fatalf("error must name the method: %+v", second.Error)
+	}
+}
+
+// TestParamsAbsentNullEmptyDistinct: omitted params, explicit null and {}
+// are three different calls. Volatile stripping may leave an explicit {},
+// but that never becomes absent params.
+func TestParamsAbsentNullEmptyDistinct(t *testing.T) {
+	srv := loadFrames(t, []testFrame{
+		c2s(req("1", "tools/list", `{}`)),
+		s2c(`{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}`),
+	})
+	res := serveInput(t, srv,
+		req("10", "tools/list", `{}`)+"\n"+
+			req("11", "tools/list", `null`)+"\n"+
+			req("12", "tools/list", "")+"\n",
+		defaultPolicy())
+	if len(res.responses) != 3 {
+		t.Fatalf("responses = %d, want 3", len(res.responses))
+	}
+	if res.responses[0].Error != nil {
+		t.Fatalf("explicit {} must match: %+v", res.responses[0].Error)
+	}
+	for i, name := range map[int]string{1: "null", 2: "omitted"} {
+		if res.responses[i].Error == nil {
+			t.Fatalf("%s params must not match explicit {}: %s", name, res.responses[i].Result)
+		}
+	}
+
+	// And the reverse: recorded omission matches omission only.
+	omitted := loadFrames(t, []testFrame{
+		c2s(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`),
+		s2c(`{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}`),
+	})
+	res = serveInput(t, omitted,
+		req("10", "tools/list", "")+"\n"+
+			req("11", "tools/list", `{}`)+"\n",
+		defaultPolicy())
+	if len(res.responses) != 2 {
+		t.Fatalf("responses = %d, want 2", len(res.responses))
+	}
+	if res.responses[0].Error != nil {
+		t.Fatalf("omitted params must match: %+v", res.responses[0].Error)
+	}
+	if res.responses[1].Error == nil {
+		t.Fatalf("explicit {} must not match omission: %s", res.responses[1].Result)
+	}
+}
+
+// TestBigIntegersExact: params decode exactly, so neighbouring integers past
+// float64 precision never collapse to one match key.
+func TestBigIntegersExact(t *testing.T) {
+	srv := loadFrames(t, []testFrame{
+		c2s(req("1", "tools/call", `{"name":"get","arguments":{"id":9007199254740992}}`)),
+		s2c(`{"jsonrpc":"2.0","id":1,"result":{"v":"even"}}`),
+	})
+	res := serveInput(t, srv,
+		req("10", "tools/call", `{"name":"get","arguments":{"id":9007199254740992}}`)+"\n"+
+			req("11", "tools/call", `{"name":"get","arguments":{"id":9007199254740993}}`)+"\n",
+		defaultPolicy())
+	if len(res.responses) != 2 {
+		t.Fatalf("responses = %d, want 2", len(res.responses))
+	}
+	if res.responses[0].Error != nil {
+		t.Fatalf("identical integers must match: %+v", res.responses[0].Error)
+	}
+	if res.responses[1].Error == nil {
+		t.Fatalf("9007199254740993 must not match 9007199254740992: %s", res.responses[1].Result)
+	}
+}
+
+// TestTruncatedCaptureFails: a torn final envelope is a corrupt cassette, not
+// a clean end.
+func TestTruncatedCaptureFails(t *testing.T) {
+	envs := frameEnvelopes(t, "test-session", proxy.TransportStdio, []testFrame{
+		c2s(req("1", "tools/list", `{}`)),
+		s2c(`{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}`),
+	})
+	var buf bytes.Buffer
+	for _, e := range envs {
+		b, err := json.Marshal(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		buf.Write(b)
+		buf.WriteByte('\n')
+	}
+	raw := buf.String()
+	cut := raw[:len(raw)-10] // inside the final envelope
+	if _, err := Load(strings.NewReader(cut), "cut"); err == nil {
+		t.Fatal("truncated capture must fail loading")
+	} else if !strings.Contains(err.Error(), "invalid JSONL envelope") {
+		t.Fatalf("error must name the cause: %v", err)
+	}
+}
+
+// TestRedactionScopedToFirstSession: a redacted second session in a
+// concatenated file must not make a clean first session unservable.
+func TestRedactionScopedToFirstSession(t *testing.T) {
+	first := frameEnvelopes(t, "first", proxy.TransportStdio, []testFrame{
+		c2s(req("1", "tools/list", `{}`)),
+		s2c(`{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}`),
+	})
+	second := frameEnvelopes(t, "second", proxy.TransportStdio, []testFrame{
+		c2s(req("1", "tools/list", `{}`)),
+		{dir: proxy.ServerToClient, rpc: `{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}`, redacted: true},
+	})
+	srv := loadEnvelopes(t, append(first, second...))
+	if srv.Redacted() {
+		t.Fatal("a redacted later session must not taint the served first session")
+	}
+	if srv.SessionID() != "first" {
+		t.Fatalf("session = %q, want first", srv.SessionID())
+	}
+	res := serveInput(t, srv, req("9", "tools/list", `{}`)+"\n", defaultPolicy())
+	if len(res.responses) != 1 || res.responses[0].Error != nil {
+		t.Fatalf("first session must serve: %+v stderr %q", res.responses, res.stderr)
+	}
+}
+
+// TestHTTPTransportRejected: an explicitly HTTP-captured session carries
+// ConnID and transport semantics the stdio mock does not model.
+func TestHTTPTransportRejected(t *testing.T) {
+	envs := frameEnvelopes(t, "http-session", proxy.TransportHTTP, []testFrame{
+		c2s(req("1", "tools/list", `{}`)),
+		s2c(`{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}`),
+	})
+	var buf bytes.Buffer
+	for _, e := range envs {
+		b, err := json.Marshal(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		buf.Write(b)
+		buf.WriteByte('\n')
+	}
+	_, err := Load(&buf, "http")
+	if err == nil {
+		t.Fatal("http capture must be refused")
+	}
+	if !strings.Contains(err.Error(), "stdio") {
+		t.Fatalf("refusal must say stdio-only: %v", err)
+	}
+}
+
+// TestLegacyNoTransportAccepted: a log whose frames name no transport is the
+// legacy shape and still mocks.
+func TestLegacyNoTransportAccepted(t *testing.T) {
+	srv := loadEnvelopes(t, frameEnvelopes(t, "legacy", "", []testFrame{
+		c2s(req("1", "tools/list", `{}`)),
+		s2c(`{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}`),
+	}))
+	res := serveInput(t, srv, req("9", "tools/list", `{}`)+"\n", defaultPolicy())
+	if len(res.responses) != 1 || res.responses[0].Error != nil {
+		t.Fatalf("unmarked capture must serve: %+v stderr %q", res.responses, res.stderr)
 	}
 }
 
