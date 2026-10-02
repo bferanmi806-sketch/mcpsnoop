@@ -210,6 +210,61 @@ func TestVolatileMetaDifferencesStillMatch(t *testing.T) {
 	}
 }
 
+// TestReservedMetaKeysSplitByWhetherTheyChangeTheAnswer pins the one judgement
+// the matcher makes. The spec reserves a fixed set of _meta keys and they do
+// not all mean the same thing here. Progress, client identity, logging level
+// and the trace keys are per-request client preference that a recorded answer
+// cannot depend on, so a replaying client which sets them differently has to
+// match anyway, and under a strict matcher a miss is a hard failure rather than
+// a worse answer. The protocol version is the era, which does change what an
+// answer means, so it stays in the key.
+func TestReservedMetaKeysSplitByWhetherTheyChangeTheAnswer(t *testing.T) {
+	const base = `"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}`
+	recorded := `{"name":"search","arguments":{"q":"kafka"},"_meta":{` + base + `}}`
+
+	for _, tc := range []struct {
+		name  string
+		extra string
+	}{
+		{"progressToken", `"progressToken":"p-9"`},
+		{"clientInfo", `"io.modelcontextprotocol/clientInfo":{"name":"other","version":"9.9"}`},
+		{"logLevel", `"io.modelcontextprotocol/logLevel":"debug"`},
+		{"traceparent", `"traceparent":"00-aaa-bbb-01"`},
+		{"tracestate", `"tracestate":"a=b"`},
+		{"baggage", `"baggage":"x=y"`},
+	} {
+		t.Run(tc.name+" does not change the answer", func(t *testing.T) {
+			srv := loadFrames(t, []testFrame{
+				c2s(req("3", "tools/call", recorded)),
+				s2c(`{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"hit for kafka"}]}}`),
+			})
+			incoming := `{"name":"search","arguments":{"q":"kafka"},"_meta":{` + base + `,` + tc.extra + `}}`
+			res := serveInput(t, srv, req("7", "tools/call", incoming)+"\n", defaultPolicy())
+			if len(res.responses) != 1 {
+				t.Fatalf("responses = %d, want 1, stderr = %q", len(res.responses), res.stderr)
+			}
+			if res.responses[0].Error != nil {
+				t.Fatalf("a client setting %s must still match the recording: %+v", tc.name, res.responses[0].Error)
+			}
+		})
+	}
+
+	t.Run("protocolVersion does change the answer", func(t *testing.T) {
+		srv := loadFrames(t, []testFrame{
+			c2s(req("3", "tools/call", recorded)),
+			s2c(`{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"hit for kafka"}]}}`),
+		})
+		incoming := `{"name":"search","arguments":{"q":"kafka"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-06-18","io.modelcontextprotocol/clientCapabilities":{}}}`
+		res := serveInput(t, srv, req("7", "tools/call", incoming)+"\n", defaultPolicy())
+		if len(res.responses) != 1 {
+			t.Fatalf("responses = %d, want 1", len(res.responses))
+		}
+		if res.responses[0].Error == nil {
+			t.Fatalf("another era is another call, got result %s", res.responses[0].Result)
+		}
+	})
+}
+
 func TestSemanticParamDifferencesDoNotMatch(t *testing.T) {
 	srv := loadFrames(t, []testFrame{
 		c2s(req("3", "tools/call", `{"name":"search","arguments":{"q":"kafka"}}`)),
@@ -701,67 +756,69 @@ func TestSupersededIDReuse(t *testing.T) {
 // TestParamsAbsentNullEmptyDistinct: omitted params, explicit null and {}
 // are three different calls. Volatile stripping may leave an explicit {},
 // but that never becomes absent params.
+// TestParamsAbsentNullEmptyDistinct keeps the three empty-ish param shapes as
+// three match keys. Each one is recorded with its own answer and then asked for
+// in the reverse order, because a capture holding a single exchange cannot tell
+// a key that did not match from a key that matched an exhausted queue, and a
+// test built that way passes even when all three collapse into one.
 func TestParamsAbsentNullEmptyDistinct(t *testing.T) {
 	srv := loadFrames(t, []testFrame{
 		c2s(req("1", "tools/list", `{}`)),
-		s2c(`{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}`),
+		s2c(`{"jsonrpc":"2.0","id":1,"result":{"shape":"empty-object"}}`),
+		c2s(req("2", "tools/list", `null`)),
+		s2c(`{"jsonrpc":"2.0","id":2,"result":{"shape":"explicit-null"}}`),
+		c2s(req("3", "tools/list", "")),
+		s2c(`{"jsonrpc":"2.0","id":3,"result":{"shape":"omitted"}}`),
 	})
 	res := serveInput(t, srv,
-		req("10", "tools/list", `{}`)+"\n"+
+		req("10", "tools/list", "")+"\n"+
 			req("11", "tools/list", `null`)+"\n"+
-			req("12", "tools/list", "")+"\n",
+			req("12", "tools/list", `{}`)+"\n",
 		defaultPolicy())
 	if len(res.responses) != 3 {
-		t.Fatalf("responses = %d, want 3", len(res.responses))
+		t.Fatalf("responses = %d, want 3, stderr = %q", len(res.responses), res.stderr)
 	}
-	if res.responses[0].Error != nil {
-		t.Fatalf("explicit {} must match: %+v", res.responses[0].Error)
-	}
-	for i, name := range map[int]string{1: "null", 2: "omitted"} {
-		if res.responses[i].Error == nil {
-			t.Fatalf("%s params must not match explicit {}: %s", name, res.responses[i].Result)
+	for i, want := range []string{"omitted", "explicit-null", "empty-object"} {
+		if res.responses[i].Error != nil {
+			t.Fatalf("response %d should have matched its own shape: %+v", i, res.responses[i].Error)
 		}
-	}
-
-	// And the reverse: recorded omission matches omission only.
-	omitted := loadFrames(t, []testFrame{
-		c2s(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`),
-		s2c(`{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}`),
-	})
-	res = serveInput(t, omitted,
-		req("10", "tools/list", "")+"\n"+
-			req("11", "tools/list", `{}`)+"\n",
-		defaultPolicy())
-	if len(res.responses) != 2 {
-		t.Fatalf("responses = %d, want 2", len(res.responses))
-	}
-	if res.responses[0].Error != nil {
-		t.Fatalf("omitted params must match: %+v", res.responses[0].Error)
-	}
-	if res.responses[1].Error == nil {
-		t.Fatalf("explicit {} must not match omission: %s", res.responses[1].Result)
+		if !strings.Contains(string(res.responses[i].Result), want) {
+			t.Fatalf("response %d = %s, want the %s answer", i, res.responses[i].Result, want)
+		}
 	}
 }
 
-// TestBigIntegersExact: params decode exactly, so neighbouring integers past
-// float64 precision never collapse to one match key.
+// TestBigIntegersExact keeps neighbouring integers past float64 precision as
+// two match keys. Both are recorded with their own answer and the later one is
+// asked for first, since a single recorded exchange would let this pass with the
+// two collapsed, and asking in recorded order would let the queue hand back the
+// right answers by position rather than by key.
 func TestBigIntegersExact(t *testing.T) {
 	srv := loadFrames(t, []testFrame{
 		c2s(req("1", "tools/call", `{"name":"get","arguments":{"id":9007199254740992}}`)),
 		s2c(`{"jsonrpc":"2.0","id":1,"result":{"v":"even"}}`),
+		c2s(req("2", "tools/call", `{"name":"get","arguments":{"id":9007199254740993}}`)),
+		s2c(`{"jsonrpc":"2.0","id":2,"result":{"v":"odd"}}`),
 	})
 	res := serveInput(t, srv,
-		req("10", "tools/call", `{"name":"get","arguments":{"id":9007199254740992}}`)+"\n"+
-			req("11", "tools/call", `{"name":"get","arguments":{"id":9007199254740993}}`)+"\n",
+		req("10", "tools/call", `{"name":"get","arguments":{"id":9007199254740993}}`)+"\n"+
+			req("11", "tools/call", `{"name":"get","arguments":{"id":9007199254740992}}`)+"\n",
 		defaultPolicy())
 	if len(res.responses) != 2 {
-		t.Fatalf("responses = %d, want 2", len(res.responses))
+		t.Fatalf("responses = %d, want 2, stderr = %q", len(res.responses), res.stderr)
 	}
-	if res.responses[0].Error != nil {
-		t.Fatalf("identical integers must match: %+v", res.responses[0].Error)
+	for i, want := range []string{"odd", "even"} {
+		if res.responses[i].Error != nil {
+			t.Fatalf("response %d should have matched its own integer: %+v", i, res.responses[i].Error)
+		}
+		if !strings.Contains(string(res.responses[i].Result), want) {
+			t.Fatalf("response %d = %s, want the %s answer, so the two integers are one key", i, res.responses[i].Result, want)
+		}
 	}
-	if res.responses[1].Error == nil {
-		t.Fatalf("9007199254740993 must not match 9007199254740992: %s", res.responses[1].Result)
+	// And the unrecorded neighbour still misses rather than borrowing either.
+	res = serveInput(t, srv, req("12", "tools/call", `{"name":"get","arguments":{"id":9007199254740994}}`)+"\n", defaultPolicy())
+	if len(res.responses) != 1 || res.responses[0].Error == nil {
+		t.Fatalf("an unrecorded integer must miss, got %+v", res.responses)
 	}
 }
 
@@ -1127,10 +1184,21 @@ func TestRoundTrip(t *testing.T) {
 		DurationThreshold: sessiondiff.DefaultDurationThreshold,
 		DurationRatio:     sessiondiff.DefaultDurationRatio,
 	})
-	if !report.Empty() {
+	// Everything the protocol carried has to match. Durations cannot, and
+	// asserting report.Empty() failed whenever the recorded server was slow
+	// enough to clear the diff's threshold, which is the ordinary case and the
+	// entire point of a mock. Assert the direction instead, since answering out
+	// of a capture is never slower than the server that was captured.
+	if report.Tools.Count() != 0 || len(report.CallChanges) != 0 {
 		var buf bytes.Buffer
 		_ = sessiondiff.WriteText(&buf, report)
-		t.Fatalf("replayed capture differs:\n%s", buf.String())
+		t.Fatalf("replayed capture differs in what the protocol carried:\n%s", buf.String())
+	}
+	for _, d := range report.DurationChanges {
+		if d.After >= d.Before {
+			t.Errorf("serving %s from the capture was not faster than the recorded server, %s -> %s",
+				d.ToolName, d.Before, d.After)
+		}
 	}
 }
 

@@ -19,6 +19,14 @@
 // client fall back to initialize), and a request the capture never answered
 // has no exchange to serve. Only stdio captures serve; HTTP is refused.
 //
+// Only responses are served. A stdio server also writes notifications that
+// relate to an in-flight request, progress and logging among them, and the
+// capture holds the ones the real server sent. Replaying those means rewriting
+// each recorded progressToken onto the incoming one and dropping the lot when
+// the replaying client did not opt in, which is its own piece of work rather
+// than a line here, so a mocked call completes without the progress the
+// original reported.
+//
 // Stdout is protocol-only. Diagnostics go to stderr.
 package mock
 
@@ -38,16 +46,30 @@ import (
 
 // volatileMetaKeys are the _meta entries that legitimately differ between the
 // client that was recorded and the client replaying now. Client identity and
-// capabilities ride every request, and progress plus W3C trace keys share the
-// same object, so two requests that are the same logical call differ in bytes.
-// These come out before comparison and everything else compares whole.
+// capabilities ride every request, and progress, logging level and the W3C
+// trace keys share the same object, so two requests that are the same logical
+// call differ in bytes. These come out before comparison and everything else
+// compares whole, which keeps protocolVersion in the key, where it belongs,
+// since the era genuinely changes what an answer means.
+//
+// The set is drawn from the reserved _meta keys the spec lists at
+// https://modelcontextprotocol.io/specification/2026-07-28/basic/index#_meta
+// and holds only the ones that cannot change what the server replied.
+// subscriptionId is absent because it rides server notifications rather than
+// client requests.
 var volatileMetaKeys = map[string]struct{}{
 	"progressToken":                              {},
 	"io.modelcontextprotocol/clientInfo":         {},
 	"io.modelcontextprotocol/clientCapabilities": {},
-	"traceparent":                                {},
-	"tracestate":                                 {},
-	"baggage":                                    {},
+	// logLevel is the minimum log level the server should emit for a request.
+	// It selects which notifications/message frames a live server sends and
+	// cannot touch the result, and the mock answers with responses only, so a
+	// client that configures logging would otherwise miss every recorded call
+	// over a key that changes nothing about the answer.
+	"io.modelcontextprotocol/logLevel": {},
+	"traceparent":                      {},
+	"tracestate":                       {},
+	"baggage":                          {},
 }
 
 // UnmatchedPolicy decides what a request the capture never recorded gets. Only

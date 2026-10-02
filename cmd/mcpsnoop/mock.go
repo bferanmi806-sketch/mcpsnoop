@@ -19,16 +19,18 @@ func newMockCmd() *cobra.Command {
 The mock reads newline-delimited JSON-RPC from stdin and writes
 newline-delimited JSON-RPC to stdout, answering every request from the
 capture. Matching is strict: method plus structurally normalized params, with
-only the volatile _meta keys (progressToken, client identity and capabilities,
-traceparent, tracestate, baggage) ignored. A request the capture never
-recorded gets a JSON-RPC error naming the method, never an unrelated recorded
-answer. Notifications draw no reply. The response carries the incoming request
-id, never the recorded one.
+only the volatile _meta keys (progressToken, client identity and
+capabilities, logging level, traceparent, tracestate, baggage) ignored. A
+request the capture never recorded gets a JSON-RPC error naming the method,
+never an unrelated recorded answer. Notifications draw no reply. The response
+carries the incoming request id, never the recorded one.
 
 What was observed is what is served: an input_required result and its
 continuation replay as the recorded hops, task calls replay as recorded
 exchanges, and a server/discover the capture never recorded is answered with
-an error rather than a synthesised result.
+an error rather than a synthesised result. Responses only, though. A recorded
+server notification, progress and logging among them, is not replayed, so a
+mocked call completes without the progress the original reported.
 
 Stdio captures only: a session explicitly captured on another transport
 (HTTP) is refused, since ConnID and transport semantics are out of scope for
